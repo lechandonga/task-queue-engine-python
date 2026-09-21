@@ -154,6 +154,80 @@ class Storage:
         )
 
     # ---- 任务 ----------------------------------------------------------
+    def submit_task(self, task: TaskRecord, now: int, max_pending: int,
+                    max_backlog_bytes: int,
+                    window_ms: int | None = None) -> tuple[str, str]:
+        """原子提交：在单个 IMMEDIATE 事务内完成“有界准入 + 去重判定 + 插入”。
+
+        返回 ``(status, task_id)``：
+
+        - ``("inserted", id)``：新任务落库（同时登记去重窗口）；
+        - ``("dedup_hit", 首次任务 id)``：窗口内同 key 已存在，不占队列额度；
+        - ``("full", "")``：待调度数量或积压字节超限（去重命中优先于 full，
+          重复提交永远不会因为队列满而被拒）。
+
+        先查窗口再查额度：重复提交直接短路返回，不被有界策略影响。
+        """
+        assert self._conn is not None
+        payload_text = json.dumps(task.payload)
+        payload_len = len(payload_text.encode("utf-8"))
+        with self._lock:
+            conn = self._conn
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if task.dedup_key is not None:
+                    r = conn.execute(
+                        "SELECT task_id, expires_at_ms FROM dedup_window "
+                        "WHERE namespace=? AND dedup_key=?",
+                        (task.namespace, task.dedup_key),
+                    ).fetchone()
+                    if r is not None and int(r["expires_at_ms"]) > now:
+                        conn.execute("COMMIT")
+                        return "dedup_hit", str(r["task_id"])
+                    conn.execute(
+                        "DELETE FROM dedup_window WHERE namespace=? AND dedup_key=?",
+                        (task.namespace, task.dedup_key),
+                    )
+
+                cnt = int(conn.execute(
+                    "SELECT COUNT(*) c FROM tasks WHERE namespace=? "
+                    "AND status IN (?, ?)",
+                    (task.namespace, TaskStatus.PENDING.value,
+                     TaskStatus.RETRY_WAIT.value),
+                ).fetchone()["c"])
+                backlog = int(conn.execute(
+                    "SELECT COALESCE(SUM(LENGTH(payload)),0) s FROM tasks "
+                    "WHERE namespace=? AND status NOT IN (?, ?, ?)",
+                    (task.namespace, *_TASK_TERMINAL),
+                ).fetchone()["s"])
+                if cnt >= max_pending or backlog + payload_len > max_backlog_bytes:
+                    conn.execute("COMMIT")
+                    return "full", ""
+
+                conn.execute(
+                    """INSERT INTO tasks(id, namespace, queue, payload, status, attempt,
+                           dedup_key, created_at_ms, updated_at_ms, run_at_ms,
+                           leased_by, lease_expires_ms, last_error)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        task.id, task.namespace, task.queue, payload_text,
+                        task.status.value, task.attempt, task.dedup_key,
+                        task.created_at_ms, task.updated_at_ms, task.run_at_ms,
+                        task.leased_by, task.lease_expires_ms, task.last_error,
+                    ),
+                )
+                if task.dedup_key is not None and window_ms is not None:
+                    conn.execute(
+                        "INSERT INTO dedup_window(namespace, dedup_key, task_id, expires_at_ms) "
+                        "VALUES(?,?,?,?)",
+                        (task.namespace, task.dedup_key, task.id, now + window_ms),
+                    )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            return "inserted", task.id
+
     def insert_task(self, task: TaskRecord) -> None:
         assert self._conn is not None
         with self._lock:
