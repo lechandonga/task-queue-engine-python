@@ -48,7 +48,7 @@ class TaskQueueEngine:
             self._storage, self._cfg, dict(handlers or {}),
             on_complete=self._on_task_complete,
             on_retry=self._metrics.record_retry,
-            on_dead=self._metrics.record_dead,
+            on_dead=self._on_task_dead,
             time_func=self._time,
             logger=self._log,
         )
@@ -97,6 +97,10 @@ class TaskQueueEngine:
 
     def _on_task_complete(self, latency_ms: int) -> None:
         self._metrics.record_complete(latency_ms)
+        self._gate.notify_space()
+
+    def _on_task_dead(self) -> None:
+        self._metrics.record_dead()
         self._gate.notify_space()
 
     # ---- 任务 ----------------------------------------------------------
