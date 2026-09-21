@@ -141,6 +141,7 @@ class TaskQueueEngine:
         if status == "dedup_hit":
             self._metrics.record_dedup_hit()
             existing = self._storage.require_task(task_id)
+            existing.dedup_hit = True
             self._log.info(
                 "task_id=%s offset=- dedup_key=%s 判定依据=窗口内重复提交，返回首次任务",
                 task_id, dedup_key)

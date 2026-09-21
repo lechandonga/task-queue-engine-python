@@ -33,6 +33,8 @@ class TaskRecord:
     leased_by: str | None = None
     lease_expires_ms: int = 0
     last_error: str | None = None
+    # 瞬态（不落库）：本次提交是否命中去重窗口
+    dedup_hit: bool = False
 
     @staticmethod
     def new_id() -> str:

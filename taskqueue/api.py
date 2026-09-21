@@ -114,7 +114,7 @@ def create_app(engine: TaskQueueEngine | None = None,
             namespace, body.payload, queue=body.queue,
             dedup_key=body.dedup_key, delay_ms=body.delay_ms)
         return {"task_id": task.id, "status": task.status.value,
-                "dedup_hit": False}
+                "dedup_hit": task.dedup_hit}
 
     @app.get("/v1/tasks/{task_id}")
     async def get_task(task_id: str):  # type: ignore[no-untyped-def]
