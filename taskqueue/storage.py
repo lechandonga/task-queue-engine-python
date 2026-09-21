@@ -404,6 +404,42 @@ class Storage:
                 for r in rows
             ]
 
+    def cancel_task(self, task_id: str, now: int) -> str:
+        """原子取消一个未终态任务。返回判定：
+
+        - ``"cancelled"``：PENDING/RETRY_WAIT 任务被置为 CANCELLED；
+        - ``"already_terminal"``：任务已 COMPLETED/DEAD/CANCELLED，取消无效；
+        - ``"running"``：任务正在执行（持租约），不能直接取消，避免与执行结果
+          竞态造成重复/卡死；待其结束或租约过期后再决定。
+        - ``"missing"``：任务不存在。
+        """
+        assert self._conn is not None
+        with self._lock:
+            conn = self._conn
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                r = conn.execute(
+                    "SELECT status FROM tasks WHERE id=?", (task_id,)
+                ).fetchone()
+                if r is None:
+                    result = "missing"
+                elif r["status"] in _TASK_TERMINAL:
+                    result = "already_terminal"
+                elif r["status"] == TaskStatus.RUNNING.value:
+                    result = "running"
+                else:
+                    conn.execute(
+                        "UPDATE tasks SET status=?, leased_by=NULL, "
+                        "lease_expires_ms=0, updated_at_ms=? WHERE id=?",
+                        (TaskStatus.CANCELLED.value, now, task_id),
+                    )
+                    result = "cancelled"
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            return result
+
     def expire_leases(self, now: int, lease_ms: int) -> int:
         """把租约超时的 RUNNING 任务退回 RETRY_WAIT 并立即可重投。
 

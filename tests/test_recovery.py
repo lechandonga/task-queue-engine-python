@@ -143,3 +143,24 @@ def test_dedup_window_survives_restart(tmp_path):
         assert t2.id == t1.id
         assert eng2.metrics()["dedup_hits"] == 1
         log.info("task_id=%s offset=- 判定依据=去重窗口持久化，重启后窗口内仍拦截", t1.id)
+
+
+def test_cancel_pending_task_and_terminal_idempotency(tmp_path):
+    """取消未决任务生效；已终态取消返回 already_terminal，不产生重复执行。"""
+    side = []
+    with TaskQueueEngine(make_cfg(tmp_path),
+                         handlers={"h": lambda p: side.append("ran")}) as eng:
+        t1 = eng.submit("ns", {"args": ["c1"], "metadata": {"handler": "h"}},
+                        delay_ms=60_000)
+        assert eng.cancel_task(t1.id) == "cancelled"
+        assert eng.get_task(t1.id).status is TaskStatus.CANCELLED
+        assert eng.cancel_task(t1.id) == "already_terminal"
+        eng.dispatcher.run_once("ns")
+        assert side == []  # 取消后绝不执行
+        log.info("task_id=%s offset=- 判定依据=延迟任务取消生效且不执行", t1.id)
+
+        t2 = eng.submit("ns", {"args": ["c2"], "metadata": {"handler": "h"}})
+        eng.dispatcher.run_once("ns")
+        assert eng.cancel_task(t2.id) == "already_terminal"
+        assert side == ["ran"]  # 已完成不受取消影响、不重复
+        log.info("task_id=%s offset=- 判定依据=已完成任务取消为幂等空操作", t2.id)

@@ -151,6 +151,22 @@ class TaskQueueEngine:
     def get_task(self, task_id: str) -> TaskRecord:
         return self._storage.require_task(task_id)
 
+    def cancel_task(self, task_id: str) -> str:
+        """取消未开始/等待重试的任务。
+
+        - 成功取消返回 ``"cancelled"``；已是终态返回 ``"already_terminal"``
+          （已生效的副作用不会因取消而回滚或重复）；
+        - 正在执行返回 ``"running"``（不与执行结果竞态），调用方可稍后重试；
+        - 任务不存在抛 :class:`NotFoundError`。
+        """
+        self._storage.require_task(task_id)
+        result = self._storage.cancel_task(task_id, self._time())
+        self._log.info("task_id=%s offset=- 判定依据=取消请求结果=%s",
+                       task_id, result)
+        if result == "cancelled":
+            self._gate.notify_space()
+        return result
+
     def list_dead_letters(self, namespace: str, queue: str | None = None,
                           limit: int = 100, offset: int = 0) -> list[DeadLetter]:
         return self._storage.list_dead_letters(namespace, queue, limit, offset)
