@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import builtins
 from enum import Enum
 
 
@@ -90,6 +91,15 @@ class InternalError(TaskQueueError):
 def normalize_error(exc: BaseException) -> TaskQueueError:
     """把底层异常归一化为 :class:`TaskQueueError`。
 
-    已知的任务队列错误原样返回；未知异常包装为 INTERNAL，不直接透出。
+    - 已是 :class:`TaskQueueError` 的直接返回；
+    - Python 内置 ``ValueError``/``TypeError`` 归一为参数错误（发生在输入解析边界时）；
+    - 内置 ``TimeoutError`` 归一为超时类别；
+    - 其余未知异常一律包装为 INTERNAL，保留 ``cause`` 链但不直接透出。
     """
-    raise NotImplementedError
+    if isinstance(exc, TaskQueueError):
+        return exc
+    if isinstance(exc, builtins.TimeoutError):
+        return TimeoutError(str(exc) or "execution timed out", cause=exc)
+    if isinstance(exc, (ValueError, TypeError)):
+        return InvalidArgumentError(str(exc) or "invalid argument", cause=exc)
+    return InternalError(f"unexpected error: {type(exc).__name__}: {exc}", cause=exc)
