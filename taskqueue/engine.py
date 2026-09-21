@@ -204,3 +204,7 @@ class TaskQueueEngine:
     @property
     def storage(self) -> Storage:
         return self._storage
+
+    @property
+    def dispatcher(self) -> Dispatcher:
+        return self._dispatcher

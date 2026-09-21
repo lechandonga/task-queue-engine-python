@@ -68,6 +68,8 @@ class Dispatcher:
         if self._workers:
             return
         self._stop.clear()
+        if self._cfg.worker_count <= 0:
+            return  # 纯手动驱动模式（测试/嵌入）：不启动后台线程
         for i in range(max(1, self._cfg.worker_count)):
             th = threading.Thread(
                 target=self._loop, name=f"tq-worker-{i}", daemon=True)
