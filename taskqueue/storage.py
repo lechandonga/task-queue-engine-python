@@ -334,8 +334,13 @@ class Storage:
             )
             return cur.rowcount == 1
 
-    def fail_task_to_dead(self, task_id: str, reason: str, now: int) -> DeadLetter | None:
-        """原子地把任务移入死信表（同事务 DELETE/UPDATE，不留中间态）。"""
+    def fail_task_to_dead(self, task_id: str, reason: str, now: int,
+                          worker_id: str | None = None) -> DeadLetter | None:
+        """原子地把任务移入死信表（同事务 UPDATE+INSERT，不留中间态）。
+
+        提供 ``worker_id`` 时仅当任务仍由该 worker 持租约才生效；
+        租约已转移（被回收重投）则返回 None（调用方放弃迟到结果）。
+        """
         assert self._conn is not None
         with self._lock:
             conn = self._conn
@@ -343,6 +348,12 @@ class Storage:
             try:
                 r = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
                 if r is None:
+                    conn.execute("COMMIT")
+                    return None
+                if worker_id is not None and (
+                    r["status"] != TaskStatus.RUNNING.value
+                    or r["leased_by"] != worker_id
+                ):
                     conn.execute("COMMIT")
                     return None
                 task = self._row_to_task(r)
