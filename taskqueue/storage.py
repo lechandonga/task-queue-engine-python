@@ -430,6 +430,17 @@ class Storage:
             ).fetchone()
             return int(r["c"])
 
+    def count_unfinished(self, namespace: str | None = None) -> int:
+        """统计非终态任务数（PENDING/RETRY_WAIT/RUNNING）；namespace=None 为全量。"""
+        assert self._conn is not None
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT COUNT(*) c FROM tasks "
+                "WHERE status NOT IN (?, ?, ?) AND (? IS NULL OR namespace=?)",
+                (*_TASK_TERMINAL, namespace, namespace),
+            ).fetchone()
+            return int(r["c"])
+
     def backlog_bytes(self, namespace: str) -> int:
         """积压内存粗估：待调度任务序列化负载的字节总和（含 RUNNING 占用）。"""
         assert self._conn is not None
