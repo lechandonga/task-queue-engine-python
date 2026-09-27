@@ -96,14 +96,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return {"topic": req.topic, "offset": offset}
 
     @app.post("/consumer-groups/{group}/poll")
-    def poll(group: str, topic: str, max_events: int = 16) -> dict:
+    def poll(group: str, topic: str, max_events: int = 16,
+             max_inflight: int = 32) -> dict:
         key = (group, topic)
         if key not in consumers:
             sink: list = []
             sinks[key] = sink
             consumers[key] = ConsumerGroup(
                 engine.store, group, topic, sink.append,
-                metrics=engine.metrics)
+                metrics=engine.metrics, max_inflight=max_inflight)
         processed = consumers[key].poll_once(max_events)
         return {"group": group, "topic": topic, "processed": processed,
                 "committed_offset": consumers[key].committed_offset}

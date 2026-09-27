@@ -53,6 +53,17 @@ CREATE TABLE IF NOT EXISTS leases (
     expires_at REAL NOT NULL,
     PRIMARY KEY (grp, topic)
 );
+CREATE TABLE IF NOT EXISTS event_claims (
+    grp        TEXT NOT NULL,
+    topic      TEXT NOT NULL,
+    offset     INTEGER NOT NULL,
+    owner      TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    state      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (grp, topic, offset)
+);
+CREATE INDEX IF NOT EXISTS idx_event_claims_expiry
+    ON event_claims(grp, topic, expires_at);
 CREATE TABLE IF NOT EXISTS offsets (
     grp        TEXT NOT NULL,
     topic      TEXT NOT NULL,
@@ -122,6 +133,16 @@ class Store:
                 " attempts, created_at, updated_at FROM tasks WHERE task_id=?",
                 (task_id,)).fetchone()
         return self._row_to_task(row) if row else None
+
+    def find_dedup(self, dedup_key: str, now: float) -> Task | None:
+        """按未过期去重键查已有任务；过期或不存在返回 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT task_id FROM dedup WHERE key=? AND expires_at>?",
+                (dedup_key, now)).fetchone()
+            if row is None:
+                return None
+            return self.get_task(row[0])
 
     # ---------- 执行生命周期 ----------
 
@@ -303,7 +324,157 @@ class Store:
                 (topic, from_offset, limit)).fetchall()
         return [(r[0], json.loads(r[1].decode("utf-8"))) for r in rows]
 
-    # ---------- 消费组租约（组内单活） ----------
+    # ---------- 事件认领与确认（组内并行消费） ----------
+    #
+    # event_claims.state: 0 = 在途（已认领待确认），1 = 已确认（连续提交后删除）。
+    # 一行即一条事件对一个消费组的处理状态，UPSERT 的 WHERE 条件保证
+    # “同一时刻同一条事件只被一个消费者有效持有”；ack/nack 都校验 owner，
+    # 崩溃接手后的迟到 ack 不生效，同一条事件不可能被算成两次成功。
+
+    def claim_events(self, group: str, topic: str, owner: str,
+                     max_events: int, ttl: float, inflight_cap: int,
+                     now: float) -> list[tuple[int, dict]]:
+        """原子认领一批在途之外的事件（含租约过期可接手的事件）。
+
+        规则：
+        - 仅认领 offset >= 组已提交位点的事件；
+        - 已被其他消费者有效认领（state=0 且未过期）的事件不会重复认领；
+        - 组内在途事件数达到 inflight_cap 时不再认领，资源占用有界；
+        - 过期认领（消费者崩溃/超时）可被任意 owner 原子接手。
+        """
+        if max_events <= 0 or inflight_cap <= 0:
+            return []
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            committed = self.get_offset(group, topic)
+            inflight = self._conn.execute(
+                "SELECT COUNT(*) FROM event_claims"
+                " WHERE grp=? AND topic=? AND state=0 AND expires_at>?",
+                (group, topic, now)).fetchone()[0]
+            budget = inflight_cap - inflight
+            if budget <= 0:
+                return []
+            want = min(max_events, budget)
+            # 扫描窗口有界：在途最多 inflight_cap 条，再多取 want 条候选。
+            # 可认领候选：无认领行，或认领已过期（state=0 且到期）；
+            # state=1（已确认，等待连续提交）的事件绝不可再认领。
+            rows = self._conn.execute(
+                "SELECT e.offset, e.payload FROM events e"
+                " WHERE e.topic=? AND e.offset>=?"
+                " AND NOT EXISTS ("
+                "   SELECT 1 FROM event_claims c WHERE c.grp=? AND c.topic=?"
+                "   AND c.offset=e.offset AND ("
+                "     c.state=1 OR (c.state=0 AND c.expires_at>?)))"
+                " ORDER BY e.offset LIMIT ?",
+                (topic, committed, group, topic, now,
+                 inflight_cap + want)).fetchall()
+            chosen = [(o, json.loads(b.decode("utf-8")))
+                      for o, b in rows[:want]]
+            for offset, _ in chosen:
+                # 只覆盖“无行/过期在途”；state=1 与有效在途被 WHERE 挡住，
+                # 并发下也不会抢成功。
+                self._conn.execute(
+                    "INSERT INTO event_claims(grp, topic, offset, owner,"
+                    " expires_at, state) VALUES(?,?,?,?,?,0)"
+                    " ON CONFLICT(grp, topic, offset) DO UPDATE SET"
+                    " owner=excluded.owner, expires_at=excluded.expires_at,"
+                    " state=0"
+                    " WHERE event_claims.state=0 AND event_claims.expires_at<=?",
+                    (group, topic, offset, owner, now + ttl, now))
+            return chosen
+
+    def ack_event(self, group: str, topic: str, offset: int,
+                  owner: str, now: float) -> tuple[bool, int]:
+        """确认单条事件处理成功，并把组位点连续推进到最大无缺口处。
+
+        返回 (applied, committed_offset)：
+        - applied=True：本次确认首次生效（该事件当前仍由该 owner 有效持有）；
+        - applied=False：重复确认、被接手后的迟到确认或事件早已越过提交
+          位点——不计成功、不产生重复的位点提交。
+
+        乱序完成时，中间未确认（在途/尚未认领）的缺口会挡住边界；
+        缺口补齐后下一次 ack 把位点一次性连续推进，不跳号。
+        """
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                "SELECT offset FROM offsets WHERE grp=? AND topic=?",
+                (group, topic)).fetchone()
+            committed = row[0] if row else 0
+            if offset < committed:
+                return False, committed  # 已连续提交过：幂等忽略
+            cur = self._conn.execute(
+                "UPDATE event_claims SET state=1, expires_at=0"
+                " WHERE grp=? AND topic=? AND offset=? AND owner=?"
+                " AND state=0 AND expires_at>?",
+                (group, topic, offset, owner, now))
+            if cur.rowcount == 0:
+                return False, committed  # 非本人有效持有或重复确认
+            next_offset = self._contiguous_offset(group, topic, committed)
+            if next_offset > committed:
+                self._conn.execute(
+                    "INSERT INTO offsets(grp, topic, offset, updated_at)"
+                    " VALUES(?,?,?,?)"
+                    " ON CONFLICT(grp, topic) DO UPDATE SET"
+                    " offset=excluded.offset, updated_at=excluded.updated_at",
+                    (group, topic, next_offset, now))
+                # 已被连续提交覆盖的确认行不再需要，删除以保持存储有界
+                self._conn.execute(
+                    "DELETE FROM event_claims"
+                    " WHERE grp=? AND topic=? AND state=1 AND offset<?",
+                    (group, topic, next_offset))
+                return True, next_offset
+            return True, committed
+
+    def _contiguous_offset(self, group: str, topic: str,
+                           committed: int) -> int:
+        """从 committed 出发求最大连续前缀边界。
+
+        每前进一步要求该 offset 已确认(state=1)；遇到在途(state=0)或
+        尚无认领行的 offset 即停止。在途行数有界（inflight_cap），
+        故此循环步数有界。
+        """
+        offset = committed
+        while True:
+            row = self._conn.execute(
+                "SELECT state FROM event_claims"
+                " WHERE grp=? AND topic=? AND offset=?",
+                (group, topic, offset)).fetchone()
+            if row is None or row[0] != 1:
+                return offset
+            offset += 1
+
+    def nack_event(self, group: str, topic: str, offset: int,
+                   owner: str) -> bool:
+        """显式放弃认领（处理失败），立即可被重新认领。返回是否生效。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM event_claims"
+                " WHERE grp=? AND topic=? AND offset=? AND owner=?"
+                " AND state=0",
+                (group, topic, offset, owner))
+            return cur.rowcount > 0
+
+    def renew_claims(self, group: str, topic: str, owner: str,
+                     ttl: float, now: float) -> int:
+        """为该 owner 仍持有的全部在途认领续租，返回续期条数。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE event_claims SET expires_at=?"
+                " WHERE grp=? AND topic=? AND owner=? AND state=0",
+                (now + ttl, group, topic, owner))
+            return cur.rowcount
+
+    def inflight_count(self, group: str, topic: str, now: float) -> int:
+        """组内在途（state=0 且未过期）事件数。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM event_claims"
+                " WHERE grp=? AND topic=? AND state=0 AND expires_at>?",
+                (group, topic, now)).fetchone()
+            return row[0]
+
+    # ---------- 消费组租约（组内单活，旧语义保留） ----------
 
     def acquire_lease(self, group: str, topic: str, owner: str,
                       ttl: float, now: float) -> bool:

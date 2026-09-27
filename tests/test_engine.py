@@ -236,3 +236,53 @@ def test_cancel_terminal_rejected(tmp_path):
         log.info("cancel terminal rejected: %s", ei.value.message)
     finally:
         eng.close()
+
+
+def test_dedup_hit_when_backlog_full(tmp_path):
+    """积压打满时，有效期内相同去重键直接返回已有任务，不报资源不足。"""
+    eng = make_engine(tmp_path, max_queue_size=3, workers=1)
+    gate = threading.Event()
+    eng.register_handler("slow", lambda a: gate.wait(10))
+    eng.start()
+    try:
+        tid1, created1 = eng.submit("ns", {"kind": "slow", "args": {"n": 1}},
+                                   dedup_key="stable-key")
+        _, created2 = eng.submit("ns", {"kind": "slow", "args": {"n": 2}},
+                                dedup_key="k2")
+        _, created3 = eng.submit("ns", {"kind": "slow", "args": {"n": 3}},
+                                dedup_key="k3")
+        assert all((created1, created2, created3))
+        # 等待 3 笔都被认领执行（在途积压占满额度）
+        deadline = time.time() + 5
+        while eng.store.pending_count("ns") < 3 and time.time() < deadline:
+            time.sleep(0.01)
+        assert eng.store.pending_count("ns") == 3
+
+        # 同键（即使 payload 不同）：窗口内命中，直接返回原任务
+        again, created = eng.submit("ns",
+                                    {"kind": "slow", "args": {"n": 999}},
+                                    dedup_key="stable-key")
+        log.info("backlog full, valid dedup key -> task=%s created=%s"
+                 " (判定依据: 去重判定先于容量判定, 返回已有任务)",
+                 again, created)
+        assert again == tid1 and created is False
+
+        # 全新去重键：容量确实不足，仍然报资源不足
+        with pytest.raises(ResourceExhaustedError) as ei:
+            eng.submit("ns", {"kind": "slow", "args": {}}, dedup_key="new")
+        log.info("backlog full, new key -> %s (判定依据: 未命中去重才走"
+                 " 容量拒绝)", ei.value.message)
+
+        # 积压释放后，同键仍返回同一任务（窗口内）
+        gate.set()
+        deadline = time.time() + 10
+        while eng.store.pending_count("ns") and time.time() < deadline:
+            time.sleep(0.02)
+        tid_last, created_last = eng.submit(
+            "ns", {"kind": "slow", "args": {}}, dedup_key="stable-key")
+        assert tid_last == tid1 and created_last is False
+        log.info("after drain, same key still maps to task=%s"
+                 " (判定依据: 去重窗口内任务身份稳定)", tid_last)
+    finally:
+        gate.set()
+        eng.close()

@@ -99,6 +99,17 @@ class TaskEngine:
         except Exception as exc:  # 底层异常不透出
             raise normalize(exc) from exc
         size = len(blob)
+        now = time.time()
+        # 容量判定之前先看去重：积压打满时，有效期内的相同去重键仍应直接
+        # 返回已有任务，而不是误报资源不足。命中不新增积压、不占额度。
+        if dedup_key is not None:
+            existing = self.store.find_dedup(dedup_key, now)
+            if existing is not None:
+                self.metrics.incr("dedup_hits")
+                logger.info("dedup hit (pre-admit) key=%s -> existing"
+                            " task=%s (判定依据: 去重窗口内, 不受容量限制)",
+                            dedup_key, existing.task_id)
+                return existing.task_id, False
         admitted = self._admit(namespace, size)
         if not admitted:
             raise ResourceExhaustedError(
@@ -106,7 +117,6 @@ class TaskEngine:
         task = Task(task_id=task_id or uuid.uuid4().hex,
                     namespace=namespace, payload=payload,
                     dedup_key=dedup_key)
-        now = time.time()
         try:
             stored, created = self.store.insert_task(
                 task, self.config.max_retries, now,
