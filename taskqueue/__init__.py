@@ -11,7 +11,7 @@ from .errors import (
 )
 from .models import Task, TaskStatus, Event
 from .engine import TaskEngine, EngineConfig
-from .consumer import ConsumerGroup
+from .consumer import ConsumerGroup, ParallelConsumer
 
 __all__ = [
     "QueueError",
@@ -27,4 +27,5 @@ __all__ = [
     "TaskEngine",
     "EngineConfig",
     "ConsumerGroup",
+    "ParallelConsumer",
 ]

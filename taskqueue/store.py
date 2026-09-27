@@ -5,6 +5,9 @@
 - 任务插入与去重键登记是原子的：重复去重键（未过期）返回已有任务，
   不产生第二条记录。
 - 位点提交是原子的：只允许单调前进，重复提交或回退抛 ConflictError。
+- 组内并行消费：event_claims 保证同一时刻一条事件只被一个消费者
+  持有（带 TTL，崩溃可重投），event_acks 记录待决确认，位点只在
+  无空缺时连续推进；ack 幂等，重复确认不计数。
 - 崩溃恢复：启动时把 RUNNING 重置为 PENDING，边界清晰。
 """
 
@@ -60,6 +63,20 @@ CREATE TABLE IF NOT EXISTS offsets (
     updated_at REAL NOT NULL,
     PRIMARY KEY (grp, topic)
 );
+CREATE TABLE IF NOT EXISTS event_claims (
+    grp        TEXT NOT NULL,
+    topic      TEXT NOT NULL,
+    offset     INTEGER NOT NULL,
+    owner      TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    PRIMARY KEY (grp, topic, offset)
+);
+CREATE TABLE IF NOT EXISTS event_acks (
+    grp    TEXT NOT NULL,
+    topic  TEXT NOT NULL,
+    offset INTEGER NOT NULL,
+    PRIMARY KEY (grp, topic, offset)
+);
 """
 
 _TERMINAL = (TaskStatus.SUCCEEDED, TaskStatus.DEAD, TaskStatus.CANCELLED)
@@ -114,6 +131,20 @@ class Store:
                     "INSERT INTO dedup(key, task_id, expires_at) VALUES(?,?,?)",
                     (task.dedup_key, task.task_id, now + dedup_ttl))
         return self.get_task(task.task_id), True
+
+    def find_task_by_dedup(self, key: str, now: float) -> Task | None:
+        """查找仍在有效期内的去重键对应的已有任务；无或已过期返回 None。
+
+        只读操作：供提交路径在占用积压额度前先判定是否为重复提交。
+        并发下的最终一致性仍由 insert_task 的原子去重保证。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT task_id, expires_at FROM dedup WHERE key=?",
+                (key,)).fetchone()
+        if row is None or row[1] <= now:
+            return None
+        return self.get_task(row[0])
 
     def get_task(self, task_id: str) -> Task | None:
         with self._lock:
@@ -328,6 +359,120 @@ class Store:
             self._conn.execute(
                 "DELETE FROM leases WHERE grp=? AND topic=? AND owner=?",
                 (group, topic, owner))
+
+    # ---------- 组内并行消费：认领 / 确认 / 重投 ----------
+
+    def claim_events(self, group: str, topic: str, owner: str,
+                     limit: int, ttl: float, now: float,
+                     max_inflight: int) -> list[tuple[int, dict]]:
+        """原子认领一批事件，供组内并行消费。
+
+        - 同一时刻同一条事件最多被一个 owner 持有（未过期认领唯一）；
+        - 组在途（未确认）事件数不超过 max_inflight，积压时有界；
+        - 已确认（含已落 acks 等待位点补齐）的事件不会再被认领；
+        - 过期认领先清理，崩溃消费者的事件可被他人重投。
+        """
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            # 清理：过期认领 + 已提交位点之前的残留认领/确认
+            self._conn.execute(
+                "DELETE FROM event_claims WHERE grp=? AND topic=?"
+                " AND expires_at<=?", (group, topic, now))
+            committed = self.get_offset(group, topic)
+            self._conn.execute(
+                "DELETE FROM event_claims WHERE grp=? AND topic=?"
+                " AND offset<?", (group, topic, committed))
+            self._conn.execute(
+                "DELETE FROM event_acks WHERE grp=? AND topic=?"
+                " AND offset<?", (group, topic, committed))
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM event_claims WHERE grp=? AND topic=?",
+                (group, topic)).fetchone()
+            available = min(limit, max_inflight - row[0])
+            if available <= 0:
+                return []
+            rows = self._conn.execute(
+                "SELECT offset, payload FROM events"
+                " WHERE topic=? AND offset>=?"
+                " AND offset NOT IN (SELECT offset FROM event_claims"
+                "                    WHERE grp=? AND topic=?)"
+                " AND offset NOT IN (SELECT offset FROM event_acks"
+                "                    WHERE grp=? AND topic=?)"
+                " ORDER BY offset LIMIT ?",
+                (topic, committed, group, topic, group, topic,
+                 available)).fetchall()
+            for offset, _ in rows:
+                self._conn.execute(
+                    "INSERT INTO event_claims(grp, topic, offset, owner,"
+                    " expires_at) VALUES(?,?,?,?,?)",
+                    (group, topic, offset, owner, now + ttl))
+            return [(r[0], json.loads(r[1].decode("utf-8"))) for r in rows]
+
+    def ack_event(self, group: str, topic: str, offset: int,
+                  now: float) -> tuple[bool, int]:
+        """确认一条事件处理成功，返回 (newly_counted, committed)。
+
+        - 幂等：位点已越过或已在 acks 中的重复确认返回 False，
+          不会重复计数、不会产生重复位点提交；
+        - 位点连续推进：只越过已确认且中间无空缺的 offset，
+          乱序完成时先落入 acks，等缺口补齐后一次性推进。
+        """
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            committed = self.get_offset(group, topic)
+            if offset < committed:
+                return False, committed  # 已被提交覆盖的重投确认
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO event_acks(grp, topic, offset)"
+                " VALUES(?,?,?)", (group, topic, offset))
+            # 该事件工作已完成，认领记录无论属谁都清理掉
+            self._conn.execute(
+                "DELETE FROM event_claims WHERE grp=? AND topic=?"
+                " AND offset=?", (group, topic, offset))
+            if cur.rowcount == 0:
+                return False, committed  # 重复确认，不计数
+            # 从 committed 起连续越过已确认的 offset
+            new_committed = committed
+            while self._conn.execute(
+                    "SELECT 1 FROM event_acks WHERE grp=? AND topic=?"
+                    " AND offset=?",
+                    (group, topic, new_committed)).fetchone():
+                self._conn.execute(
+                    "DELETE FROM event_acks WHERE grp=? AND topic=?"
+                    " AND offset=?", (group, topic, new_committed))
+                new_committed += 1
+            if new_committed > committed:
+                self._conn.execute(
+                    "INSERT INTO offsets(grp, topic, offset, updated_at)"
+                    " VALUES(?,?,?,?)"
+                    " ON CONFLICT(grp, topic) DO UPDATE SET"
+                    " offset=excluded.offset,"
+                    " updated_at=excluded.updated_at",
+                    (group, topic, new_committed, now))
+            return True, new_committed
+
+    def nack_event(self, group: str, topic: str, offset: int,
+                   owner: str) -> None:
+        """处理失败：立即释放自己的认领，事件可被组内他人重投。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM event_claims WHERE grp=? AND topic=?"
+                " AND offset=? AND owner=?", (group, topic, offset, owner))
+
+    def release_claims(self, group: str, topic: str, owner: str) -> int:
+        """消费者退出：释放其全部在途认领，返回释放条数。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM event_claims WHERE grp=? AND topic=?"
+                " AND owner=?", (group, topic, owner))
+            return cur.rowcount
+
+    def inflight_count(self, group: str, topic: str, now: float) -> int:
+        """组在途（已认领未确认且未过期）事件数。"""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM event_claims WHERE grp=? AND topic=?"
+                " AND expires_at>?", (group, topic, now)).fetchone()[0]
 
     # ---------- 内部 ----------
 

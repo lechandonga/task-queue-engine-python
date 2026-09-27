@@ -92,6 +92,15 @@ class TaskEngine:
         """
         if not namespace:
             raise ValidationError("namespace must be non-empty")
+        # 去重判定先于容量检查：队列打满时，命中有效期内相同去重键的
+        # 提交直接返回已有任务，而不是报资源不足。
+        if dedup_key is not None:
+            existing = self.store.find_task_by_dedup(dedup_key, time.time())
+            if existing is not None:
+                self.metrics.incr("dedup_hits")
+                logger.info("dedup hit key=%s -> existing task=%s"
+                            " (pre-admit)", dedup_key, existing.task_id)
+                return existing.task_id, False
         try:
             blob = payload_codec.encode(payload)  # 结构校验在此完成
         except QueueError:
